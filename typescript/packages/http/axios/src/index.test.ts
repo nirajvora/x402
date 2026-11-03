@@ -6,7 +6,12 @@ import axios, {
   InternalAxiosRequestConfig,
 } from "axios";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { wrapAxiosWithPayment, wrapAxiosWithPaymentFromConfig } from "./index";
+import {
+  PaymentHoldCapacityError,
+  PaymentOutcomeUnknownError,
+  wrapAxiosWithPayment,
+  wrapAxiosWithPaymentFromConfig,
+} from "./index";
 import type { x402Client, x402ClientConfig } from "@x402/core/client";
 import { MAX_CONTROL_PLANE_RESPONSE_BYTES, ResponseBodyTooLargeError } from "@x402/core/http";
 import type { PaymentPayload, PaymentRequired, PaymentRequirements } from "@x402/core/types";
@@ -860,6 +865,777 @@ describe("wrapAxiosWithPayment()", () => {
 
     expect(result).toBe(retryResponse);
     expect(MockX402HTTPClient.prototype.processPaymentResult).toHaveBeenCalledTimes(2);
+  });
+
+  // Maintainer regressions for the three purchase-hold corrections. The adapter
+  // below is a browser-compatible fixture: it records the consumer path and
+  // does not launch a browser or open a network.
+  const payloadSignature = (payload: PaymentPayload): string => {
+    const signature = payload.payload.signature;
+    return typeof signature === "string" ? signature : "";
+  };
+
+  const dispatchAdapter = (
+    config: InternalAxiosRequestConfig,
+    response: AxiosResponse,
+  ): AxiosResponse => {
+    const validateStatus = config.validateStatus;
+    if (!response.status || !validateStatus || validateStatus(response.status)) {
+      return response;
+    }
+    throw new AxiosError(
+      `Request failed with status code ${response.status}`,
+      AxiosError.ERR_BAD_REQUEST,
+      config,
+      {},
+      response,
+    );
+  };
+
+  const retainNewerPurchase = async (useRecovery: boolean): Promise<void> => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
+    let nextId = 0;
+    let releaseCreate = (): void => undefined;
+    const createGate = new Promise<void>(resolve => {
+      releaseCreate = resolve;
+    });
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      nextId += 1;
+      const payload: PaymentPayload = {
+        ...validPaymentPayload,
+        payload: { signature: `0x${nextId}` },
+      };
+      if (nextId === 1) {
+        await createGate;
+      }
+      return payload;
+    });
+    (
+      MockX402HTTPClient.prototype.encodePaymentSignatureHeader as ReturnType<typeof vi.fn>
+    ).mockImplementation((payload: PaymentPayload) => ({
+      "PAYMENT-SIGNATURE": `pay-${payloadSignature(payload)}`,
+    }));
+    (
+      MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>
+    ).mockImplementation(async (_payload: PaymentPayload, _header: unknown, status: number) => ({
+      recovered: useRecovery && status === 402,
+    }));
+
+    const hookWaiters: Array<(value: null) => void> = [];
+    let gateHooks = true;
+    (
+      MockX402HTTPClient.prototype.handlePaymentRequired as ReturnType<typeof vi.fn>
+    ).mockImplementation(
+      () =>
+        new Promise(resolve => {
+          if (!gateHooks) {
+            resolve(null);
+            return;
+          }
+          hookWaiters.push(resolve);
+        }),
+    );
+
+    const paid: Array<{ payment: string; release: (status: number) => void }> = [];
+    const api = wrapAxiosWithPayment(
+      axios.create({
+        baseURL: "https://api.example.com",
+        adapter: async (config: InternalAxiosRequestConfig) => {
+          const raw = config.headers.get("PAYMENT-SIGNATURE");
+          const payment = typeof raw === "string" ? raw : "";
+          const respond = (status: number): AxiosResponse =>
+            ({
+              data: status === 402 ? validPaymentRequired : status < 400 ? "ok" : "ambiguous",
+              status,
+              statusText: String(status),
+              headers: status === 402 ? { "PAYMENT-REQUIRED": "encoded-payment-required" } : {},
+              config,
+              request: {},
+            }) as AxiosResponse;
+          if (payment.length === 0) {
+            return dispatchAdapter(config, respond(402));
+          }
+          let released = false;
+          let resolveStatus: (status: number) => void = () => undefined;
+          const gate = new Promise<number>(resolve => {
+            resolveStatus = resolve;
+          });
+          paid.push({
+            payment,
+            release: status => {
+              if (released) {
+                return;
+              }
+              released = true;
+              resolveStatus(status);
+            },
+          });
+          return dispatchAdapter(config, respond(await gate));
+        },
+      }),
+      mockClient,
+    );
+
+    const pending: Array<Promise<unknown>> = [];
+    const track = <T>(promise: Promise<T>): Promise<T> => {
+      pending.push(
+        promise.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+      return promise;
+    };
+    const settle = async (
+      pendingCall: Promise<AxiosResponse>,
+    ): Promise<{ response?: AxiosResponse; error?: unknown }> => {
+      try {
+        return { response: await pendingCall };
+      } catch (error) {
+        return { error };
+      }
+    };
+
+    const originals = [track(api.get("/item")), track(api.get("/item"))];
+    try {
+      await vi.waitFor(
+        () => {
+          expect(hookWaiters.length).toBe(2);
+        },
+        { timeout: 4000, interval: 10 },
+      );
+      gateHooks = false;
+      for (const release of hookWaiters.splice(0, hookWaiters.length)) {
+        release(null);
+      }
+      await vi.waitFor(
+        () => {
+          expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 4000, interval: 10 },
+      );
+      releaseCreate();
+      await vi.waitFor(
+        () => {
+          expect(paid.length).toBe(2);
+        },
+        { timeout: 4000, interval: 10 },
+      );
+
+      const lateIndex = useRecovery ? 3 : 1;
+      if (useRecovery) {
+        paid[0].release(402);
+        paid[1].release(402);
+        await vi.waitFor(
+          () => {
+            expect(paid.length).toBe(4);
+          },
+          { timeout: 4000, interval: 10 },
+        );
+        paid[2].release(200);
+      } else {
+        paid[0].release(200);
+      }
+
+      const early = await Promise.race(originals.map(call => settle(call)));
+      expect(early.response?.status).toBe(200);
+      expect(paid[lateIndex].payment).toBe("pay-0x1");
+
+      const newerPending = track(api.get("/item"));
+      await vi.waitFor(
+        () => {
+          expect(paid.length).toBe(useRecovery ? 5 : 3);
+        },
+        { timeout: 4000, interval: 10 },
+      );
+      const newerSlot = paid[paid.length - 1];
+      expect(newerSlot.payment).toBe("pay-0x2");
+      newerSlot.release(500);
+      const newer = await settle(newerPending);
+      expect(newer.error).toBeInstanceOf(AxiosError);
+      expect((newer.error as AxiosError).response?.status).toBe(500);
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+
+      paid[lateIndex].release(200);
+      const oldResults = await Promise.all(originals.map(call => settle(call)));
+      expect(oldResults.map(result => result.response?.status)).toEqual([200, 200]);
+
+      const retryPending = track(api.get("/item"));
+      await vi.waitFor(
+        () => {
+          expect(paid.length).toBe(useRecovery ? 6 : 4);
+        },
+        { timeout: 4000, interval: 10 },
+      );
+      const retrySlot = paid[paid.length - 1];
+      expect(retrySlot.payment).toBe("pay-0x2");
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+      retrySlot.release(500);
+      const retried = await settle(retryPending);
+      expect(retried.error).toBeInstanceOf(PaymentOutcomeUnknownError);
+      expect(payloadSignature((retried.error as PaymentOutcomeUnknownError).paymentPayload)).toBe(
+        "0x2",
+      );
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+    } finally {
+      gateHooks = false;
+      for (const release of hookWaiters.splice(0, hookWaiters.length)) {
+        release(null);
+      }
+      releaseCreate();
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        for (const slot of paid) {
+          slot.release(500);
+        }
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      await Promise.allSettled(pending);
+    }
+  };
+
+  it("retains the newer purchase when a late success arrives on the direct delivery path", async () => {
+    await retainNewerPurchase(false);
+  });
+
+  it("retains the newer purchase when a late success arrives on the recovery delivery path", async () => {
+    await retainNewerPurchase(true);
+  });
+
+  it("does not share a purchase between binary x and the literal text eA==", async () => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
+    let nextId = 0;
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      nextId += 1;
+      return {
+        ...validPaymentPayload,
+        payload: { signature: `0x${nextId}` },
+      } as PaymentPayload;
+    });
+    (
+      MockX402HTTPClient.prototype.encodePaymentSignatureHeader as ReturnType<typeof vi.fn>
+    ).mockImplementation((payload: PaymentPayload) => ({
+      "PAYMENT-SIGNATURE": `pay-${payloadSignature(payload)}`,
+    }));
+
+    const wire: string[] = [];
+    const signatures: string[] = [];
+    const api = wrapAxiosWithPayment(
+      axios.create({
+        baseURL: "https://api.example.com",
+        adapter: async (config: InternalAxiosRequestConfig) => {
+          const raw = config.headers.get("PAYMENT-SIGNATURE");
+          const payment = typeof raw === "string" ? raw : "";
+          if (payment.length > 0) {
+            signatures.push(payment);
+            wire.push(
+              Buffer.isBuffer(config.data) ? config.data.toString("utf8") : String(config.data),
+            );
+          }
+          const status = payment.length > 0 ? 500 : 402;
+          return dispatchAdapter(config, {
+            data: status === 402 ? validPaymentRequired : "ambiguous",
+            status,
+            statusText: String(status),
+            headers: status === 402 ? { "PAYMENT-REQUIRED": "encoded-payment-required" } : {},
+            config,
+            request: {},
+          } as AxiosResponse);
+        },
+      }),
+      mockClient,
+    );
+
+    const headers = { "Content-Type": "application/octet-stream" };
+    const settle = async (pendingCall: Promise<AxiosResponse>) => {
+      try {
+        return { response: await pendingCall, error: undefined };
+      } catch (error) {
+        return { response: undefined, error };
+      }
+    };
+    const binary = await settle(api.post("/item", Buffer.from("x"), { headers }));
+    const text = await settle(api.post("/item", "eA==", { headers }));
+    const binaryAgain = await settle(api.post("/item", Buffer.from("x"), { headers }));
+
+    expect(signatures).toEqual(["pay-0x1", "pay-0x2", "pay-0x1"]);
+    expect(wire).toEqual(["x", "eA==", "x"]);
+    expect(binary.error).toBeInstanceOf(AxiosError);
+    expect((binary.error as AxiosError).response?.status).toBe(500);
+    expect(text.error).toBeInstanceOf(AxiosError);
+    expect(text.error).not.toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect((text.error as AxiosError).response?.status).toBe(500);
+    expect(binaryAgain.error).toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(payloadSignature((binaryAgain.error as PaymentOutcomeUnknownError).paymentPayload)).toBe(
+      "0x1",
+    );
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+
+    const verb = await settle(api.put("/item", "eA==", { headers }));
+    expect(verb.error).toBeInstanceOf(AxiosError);
+    expect(verb.error).not.toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(3);
+
+    const otherResource = await settle(api.post("/other", Buffer.from("x"), { headers }));
+    expect(otherResource.error).toBeInstanceOf(AxiosError);
+    expect(otherResource.error).not.toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(4);
+    expect(signatures.slice(3)).toEqual(["pay-0x3", "pay-0x4"]);
+
+    const identity = [(data: unknown) => data];
+    const encoded = await settle(
+      api.post("/item", new URLSearchParams("a=1"), { headers, transformRequest: identity }),
+    );
+    const encodedAgain = await settle(
+      api.post("/item", new URLSearchParams("a=1"), { headers, transformRequest: identity }),
+    );
+    const encodedText = await settle(
+      api.post("/item", "a=1", { headers, transformRequest: identity }),
+    );
+    expect(encoded.error).toBeInstanceOf(AxiosError);
+    expect((encoded.error as AxiosError).response?.status).toBe(500);
+    expect(encodedAgain.error).toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(
+      payloadSignature((encodedAgain.error as PaymentOutcomeUnknownError).paymentPayload),
+    ).toBe("0x5");
+    expect(encodedText.error).toBeInstanceOf(AxiosError);
+    expect(encodedText.error).not.toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(6);
+
+    const document = { a: 1 };
+    const structured = await settle(
+      api.post("/item", document, { headers, transformRequest: identity }),
+    );
+    const structuredAgain = await settle(
+      api.post("/item", document, { headers, transformRequest: identity }),
+    );
+    const structuredText = await settle(
+      api.post("/item", JSON.stringify(document), { headers, transformRequest: identity }),
+    );
+    expect(structured.error).toBeInstanceOf(AxiosError);
+    expect(structuredAgain.error).toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(
+      payloadSignature((structuredAgain.error as PaymentOutcomeUnknownError).paymentPayload),
+    ).toBe("0x7");
+    expect(structuredText.error).toBeInstanceOf(AxiosError);
+    expect(structuredText.error).not.toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(8);
+    expect(signatures.slice(5)).toEqual([
+      "pay-0x5",
+      "pay-0x5",
+      "pay-0x6",
+      "pay-0x7",
+      "pay-0x7",
+      "pay-0x8",
+    ]);
+  });
+
+  it("keys ArrayBuffer and byte views without a global Buffer", async () => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      validPaymentPayload,
+    );
+    (
+      MockX402HTTPClient.prototype.encodePaymentSignatureHeader as ReturnType<typeof vi.fn>
+    ).mockReturnValue({ "PAYMENT-SIGNATURE": "encoded-payment-header" });
+
+    const observed: Array<{ bufferAbsent: boolean; bytes: number[]; paid: boolean }> = [];
+    const byteList = (data: unknown): number[] => {
+      if (data instanceof ArrayBuffer) {
+        return [...new Uint8Array(data)];
+      }
+      if (ArrayBuffer.isView(data)) {
+        return [...new Uint8Array(data.buffer, data.byteOffset, data.byteLength)];
+      }
+      return [];
+    };
+    const api = wrapAxiosWithPayment(
+      axios.create({
+        baseURL: "https://browser.invalid",
+        adapter: async (config: InternalAxiosRequestConfig) => {
+          const raw = config.headers.get("PAYMENT-SIGNATURE");
+          const payment = typeof raw === "string" ? raw : "";
+          observed.push({
+            bufferAbsent: typeof globalThis.Buffer === "undefined",
+            bytes: byteList(config.data),
+            paid: payment.length > 0,
+          });
+          const status = payment.length > 0 ? 500 : 402;
+          return dispatchAdapter(config, {
+            data: status === 402 ? validPaymentRequired : "ambiguous",
+            status,
+            statusText: String(status),
+            headers: status === 402 ? { "PAYMENT-REQUIRED": "encoded-payment-required" } : {},
+            config,
+            request: {},
+          } as AxiosResponse);
+        },
+      }),
+      mockClient,
+    );
+
+    const globalRecord = globalThis as { Buffer?: typeof Buffer };
+    const originalBuffer = globalRecord.Buffer;
+    const settle = async (pendingCall: Promise<AxiosResponse>) => {
+      try {
+        return { response: await pendingCall, error: undefined };
+      } catch (error) {
+        return { response: undefined, error };
+      }
+    };
+    let first: { response?: AxiosResponse; error?: unknown };
+    let second: { response?: AxiosResponse; error?: unknown };
+    try {
+      globalRecord.Buffer = undefined;
+      const identity = [(data: unknown) => data];
+      first = await settle(
+        api.post("/item", Uint8Array.from([120]).buffer, {
+          headers: { "Content-Type": "application/octet-stream" },
+          transformRequest: identity,
+        }),
+      );
+      const view = new Uint8Array(new Uint8Array([9, 120, 9]).buffer, 1, 1);
+      second = await settle(
+        api.post("/item", view, {
+          headers: { "Content-Type": "application/octet-stream" },
+          transformRequest: identity,
+        }),
+      );
+    } finally {
+      globalRecord.Buffer = originalBuffer;
+    }
+
+    expect(globalRecord.Buffer).toBe(originalBuffer);
+    expect(first.error).toBeInstanceOf(AxiosError);
+    expect((first.error as AxiosError).response?.status).toBe(500);
+    expect(second.error).toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1);
+    expect(observed).toHaveLength(4);
+    expect(observed.every(row => row.bufferAbsent)).toBe(true);
+    expect(observed.every(row => JSON.stringify(row.bytes) === "[120]")).toBe(true);
+    expect(observed.filter(row => row.paid)).toHaveLength(2);
+  });
+
+  const paidFailure = (): AxiosResponse => createAxiosResponse(500, "ambiguous");
+
+  const callWith = (
+    url: string,
+    data?: unknown,
+    config: Partial<InternalAxiosRequestConfig> = {},
+  ): Promise<AxiosResponse> => {
+    const requestConfig = createErrorConfig();
+    requestConfig.url = url;
+    requestConfig.method = config.method ?? requestConfig.method;
+    if (data !== undefined) {
+      requestConfig.data = data as InternalAxiosRequestConfig["data"];
+    }
+    if (config.baseURL) {
+      requestConfig.baseURL = config.baseURL;
+    }
+    return interceptor(createAxiosError(402, requestConfig, validPaymentRequired));
+  };
+
+  it("counts another in-flight purchase when choosing whether a new purchase can be held", async () => {
+    const releases: Array<(payload: PaymentPayload) => void> = [];
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockImplementation(
+      () =>
+        new Promise<PaymentPayload>(resolve => {
+          releases.push(resolve);
+        }),
+    );
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(
+      createAxiosResponse(200, "ok"),
+    );
+
+    const first = callWith("https://api.example.com/flight");
+    await vi.waitFor(() => {
+      expect(releases).toHaveLength(1);
+    });
+    const second = callWith("https://api.example.com/other-flight");
+    await vi.waitFor(() => {
+      expect(releases).toHaveLength(2);
+    });
+    releases[0]({ ...validPaymentPayload, payload: { signature: "0xflight" } });
+    await expect(first).resolves.toMatchObject({ status: 200 });
+    releases[1]({ ...validPaymentPayload, payload: { signature: "0xother" } });
+    await expect(second).resolves.toMatchObject({ status: 200 });
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a new purchase at 1000 held payments instead of dropping one", async () => {
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    for (let index = 1; index <= 1000; index += 1) {
+      const result = await callWith(`https://api.example.com/k/${index}`);
+      expect(result.status).toBe(500);
+    }
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1000);
+    await expect(callWith("https://api.example.com/k/1")).rejects.toBeInstanceOf(
+      PaymentOutcomeUnknownError,
+    );
+    await expect(callWith("https://api.example.com/k/1001")).rejects.toBeInstanceOf(
+      PaymentHoldCapacityError,
+    );
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1000);
+  });
+
+  it("releases a hold only after the window, the grace, and an unsettled reconcile", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const start = new Date("2026-01-01T00:00:00.000Z");
+    vi.setSystemTime(start);
+    const reconcile = vi.fn(async () => "unsettled" as const);
+    (
+      mockClient as unknown as { reconcilePaymentPayload?: typeof reconcile }
+    ).reconcilePaymentPayload = reconcile;
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    try {
+      await expect(callWith("https://api.example.com/release")).resolves.toMatchObject({
+        status: 500,
+      });
+      await expect(callWith("https://api.example.com/release")).rejects.toBeInstanceOf(
+        PaymentOutcomeUnknownError,
+      );
+      vi.setSystemTime(start.getTime() + 300_000 + 14_999);
+      await expect(callWith("https://api.example.com/release")).rejects.toBeInstanceOf(
+        PaymentOutcomeUnknownError,
+      );
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(start.getTime() + 300_000 + 15_000);
+      await expect(callWith("https://api.example.com/release")).resolves.toMatchObject({
+        status: 500,
+      });
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+      expect(reconcile).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the held payload when reconcile is missing, throws, settled, or not a known result", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    const clientWithReconcile = mockClient as {
+      reconcilePaymentPayload?: (payload: PaymentPayload) => Promise<unknown>;
+    };
+    try {
+      await callWith("https://api.example.com/missing");
+      vi.setSystemTime(new Date("2026-01-02T00:00:00.000Z"));
+      await expect(callWith("https://api.example.com/missing")).rejects.toBeInstanceOf(
+        PaymentOutcomeUnknownError,
+      );
+
+      const cases: Array<[string, () => Promise<unknown>]> = [
+        ["https://api.example.com/throws", async () => Promise.reject(new Error("down"))],
+        ["https://api.example.com/settled", async () => "settled"],
+        ["https://api.example.com/unknown", async () => "unknown"],
+        ["https://api.example.com/garbage", async () => "maybe"],
+      ];
+      for (const [url, implementation] of cases) {
+        clientWithReconcile.reconcilePaymentPayload = implementation;
+        await expect(callWith(url)).resolves.toMatchObject({ status: 500 });
+        await expect(callWith(url)).rejects.toBeInstanceOf(PaymentOutcomeUnknownError);
+      }
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1 + cases.length);
+    } finally {
+      delete clientWithReconcile.reconcilePaymentPayload;
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a hold that has no numeric settlement window", async () => {
+    const openPayload: PaymentPayload = {
+      ...validPaymentPayload,
+      accepted: { ...validPaymentRequired.accepts[0] },
+    };
+    delete (openPayload.accepted as { maxTimeoutSeconds?: number }).maxTimeoutSeconds;
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockResolvedValue(openPayload);
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    (
+      mockClient as unknown as { reconcilePaymentPayload?: () => Promise<string> }
+    ).reconcilePaymentPayload = async () => "unsettled";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      await expect(callWith("https://api.example.com/open")).resolves.toMatchObject({
+        status: 500,
+      });
+      vi.setSystemTime(new Date("2027-01-01T00:00:00.000Z"));
+      await expect(callWith("https://api.example.com/open")).rejects.toBeInstanceOf(
+        PaymentOutcomeUnknownError,
+      );
+      expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (mockClient as { reconcilePaymentPayload?: unknown }).reconcilePaymentPayload;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not key streams, FormData, or unstringifiable bodies, and signs a fresh unkeyed recovery", async () => {
+    mockAxiosClient.getUri = config => config?.url ?? "";
+    const circular: { self?: unknown } = {};
+    circular.self = circular;
+    const unkeyed = [
+      new FormData(),
+      { pipe: () => undefined },
+      new ReadableStream(),
+      circular,
+      Symbol("body"),
+      { toJSON: () => undefined },
+    ];
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    for (const body of unkeyed) {
+      await expect(callWith("https://api.example.com/unsafe", body)).resolves.toMatchObject({
+        status: 500,
+      });
+      await expect(callWith("https://api.example.com/unsafe", body)).resolves.toMatchObject({
+        status: 500,
+      });
+    }
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(unkeyed.length * 2);
+
+    const sameObject = { item: "x" };
+    await expect(callWith("https://api.example.com/json", sameObject)).resolves.toMatchObject({
+      status: 500,
+    });
+    await expect(callWith("https://api.example.com/json", sameObject)).rejects.toBeInstanceOf(
+      PaymentOutcomeUnknownError,
+    );
+    await expect(callWith("https://api.example.com/number", 1)).resolves.toMatchObject({
+      status: 500,
+    });
+    await expect(callWith("https://api.example.com/number", true)).resolves.toMatchObject({
+      status: 500,
+    });
+    const params = new URLSearchParams("a=1");
+    await expect(callWith("https://api.example.com/query", params)).resolves.toMatchObject({
+      status: 500,
+    });
+    await expect(callWith("https://api.example.com/query", params)).rejects.toBeInstanceOf(
+      PaymentOutcomeUnknownError,
+    );
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(unkeyed.length * 2 + 4);
+
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      createAxiosResponse(402, validPaymentRequired),
+    );
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      createAxiosResponse(200, "ok"),
+    );
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
+    (MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ recovered: true })
+      .mockResolvedValueOnce({ recovered: false });
+    const recovered = await callWith("https://api.example.com/form-recover", new FormData());
+    expect(recovered.status).toBe(200);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(unkeyed.length * 2 + 6);
+
+    let recoveryCreates = 0;
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      recoveryCreates += 1;
+      if (recoveryCreates === 2) {
+        throw new Error("fresh failed");
+      }
+      return validPaymentPayload;
+    });
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      createAxiosResponse(402, validPaymentRequired),
+    );
+    (
+      MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({ recovered: true });
+    await expect(
+      callWith("https://api.example.com/form-fresh-fails", new FormData()),
+    ).rejects.toThrow("Failed to create payment payload: fresh failed");
+
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      throw new Error("boom");
+    });
+    await expect(callWith("https://api.example.com/sync")).rejects.toThrow(
+      "Failed to create payment payload: boom",
+    );
+    await expect(callWith("https://api.example.com/sync")).rejects.toThrow(
+      "Failed to create payment payload: boom",
+    );
+  });
+
+  it("keeps a represented purchase when the recovery retry is not delivered", async () => {
+    const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
+    (
+      MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>
+    ).mockImplementation(async (_payload: PaymentPayload, _header: unknown, status: number) => ({
+      recovered: status === 402,
+    }));
+    const request = mockAxiosClient.request as ReturnType<typeof vi.fn>;
+    request.mockResolvedValueOnce(paidFailure());
+    await expect(callWith("https://api.example.com/recover-throw")).resolves.toMatchObject({
+      status: 500,
+    });
+    request.mockResolvedValueOnce(createAxiosResponse(402, validPaymentRequired));
+    request.mockRejectedValueOnce("network down");
+    const thrown = await callWith("https://api.example.com/recover-throw").catch(
+      (error: unknown) => error,
+    );
+    expect(thrown).toBeInstanceOf(PaymentOutcomeUnknownError);
+    expect((thrown as PaymentOutcomeUnknownError).response).toBeUndefined();
+    expect((thrown as PaymentOutcomeUnknownError).message).toContain("no response");
+
+    request.mockResolvedValueOnce(paidFailure());
+    await expect(callWith("https://api.example.com/recover-status")).resolves.toMatchObject({
+      status: 500,
+    });
+    request.mockResolvedValueOnce(createAxiosResponse(402, validPaymentRequired));
+    request.mockResolvedValueOnce(paidFailure());
+    await expect(callWith("https://api.example.com/recover-status")).rejects.toBeInstanceOf(
+      PaymentOutcomeUnknownError,
+    );
+
+    request.mockResolvedValueOnce(createAxiosResponse(402, validPaymentRequired));
+    request.mockResolvedValueOnce(paidFailure());
+    const unkeyed = await callWith("https://api.example.com/recover-unkeyed", new FormData());
+    expect(unkeyed.status).toBe(500);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(4);
+  });
+
+  it("rejects oversized ArrayBuffer and Blob payment bodies before creating a payload", async () => {
+    const oversized = MAX_CONTROL_PLANE_RESPONSE_BYTES + 1;
+    await expect(
+      interceptor(
+        createAxiosError(
+          402,
+          createErrorConfig(),
+          new ArrayBuffer(oversized) as unknown as PaymentRequired,
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ResponseBodyTooLargeError);
+    await expect(
+      interceptor(
+        createAxiosError(
+          402,
+          createErrorConfig(),
+          new Blob([new Uint8Array(oversized)]) as unknown as PaymentRequired,
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ResponseBodyTooLargeError);
+    expect(mockClient.createPaymentPayload).not.toHaveBeenCalled();
+  });
+
+  it("keeps the caller URL when Axios cannot serialize the purchase", async () => {
+    mockAxiosClient.getUri = () => {
+      throw new Error("bad uri");
+    };
+    (mockAxiosClient.request as ReturnType<typeof vi.fn>).mockResolvedValue(paidFailure());
+    await expect(
+      callWith("https://api.example.com/raw", undefined, { baseURL: "https://api.example.com" }),
+    ).resolves.toMatchObject({ status: 500 });
+    await expect(
+      callWith("https://api.example.com/raw", undefined, { baseURL: "https://api.example.com" }),
+    ).rejects.toBeInstanceOf(PaymentOutcomeUnknownError);
+    const config = createErrorConfig();
+    delete (config as { url?: string }).url;
+    config.baseURL = "https://api.example.com/base";
+    await expect(
+      interceptor(createAxiosError(402, config, validPaymentRequired)),
+    ).resolves.toMatchObject({ status: 500 });
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
   });
 });
 

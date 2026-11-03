@@ -423,7 +423,7 @@ describe("wrapAxiosWithPayment()", () => {
     );
   });
 
-  it("should recover from a corrective 402 paid retry with one fresh payload retry", async () => {
+  it("should re-present the held payload when a paid retry hook asks to recover", async () => {
     const { x402HTTPClient: MockX402HTTPClient } = await import("@x402/core/client");
     const correctiveResponse = createAxiosResponse(402, validPaymentRequired, {
       "PAYMENT-REQUIRED": "corrective-payment-required",
@@ -435,14 +435,10 @@ describe("wrapAxiosWithPayment()", () => {
         "PAYMENT-RESPONSE": "settled",
       },
     );
-    const freshPaymentPayload: PaymentPayload = {
-      ...validPaymentPayload,
-      payload: { signature: "0xfreshsignature" },
-    };
 
-    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(validPaymentPayload)
-      .mockResolvedValueOnce(freshPaymentPayload);
+    (mockClient.createPaymentPayload as ReturnType<typeof vi.fn>).mockResolvedValue(
+      validPaymentPayload,
+    );
     (MockX402HTTPClient.prototype.processPaymentResult as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({ recovered: true })
       .mockResolvedValueOnce({ recovered: false });
@@ -455,7 +451,7 @@ describe("wrapAxiosWithPayment()", () => {
 
     expect(result).toBe(successResponse);
     expect(mockAxiosClient.request).toHaveBeenCalledTimes(2);
-    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(2);
+    expect(mockClient.createPaymentPayload).toHaveBeenCalledTimes(1);
     expect(MockX402HTTPClient.prototype.processPaymentResult).toHaveBeenCalledTimes(2);
     expect(MockX402HTTPClient.prototype.processPaymentResult).toHaveBeenNthCalledWith(
       1,
@@ -465,7 +461,7 @@ describe("wrapAxiosWithPayment()", () => {
     );
     expect(MockX402HTTPClient.prototype.processPaymentResult).toHaveBeenNthCalledWith(
       2,
-      freshPaymentPayload,
+      validPaymentPayload,
       expect.any(Function),
       200,
     );

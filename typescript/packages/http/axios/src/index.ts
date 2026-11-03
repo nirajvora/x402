@@ -1,6 +1,10 @@
 import { x402Client, x402ClientConfig, x402HTTPClient } from "@x402/core/client";
 import { MAX_CONTROL_PLANE_RESPONSE_BYTES, ResponseBodyTooLargeError } from "@x402/core/http";
-import { type PaymentRequired } from "@x402/core/types";
+import {
+  type PaymentPayload,
+  type PaymentReconcileResult,
+  type PaymentRequired,
+} from "@x402/core/types";
 import { type AxiosInstance, type AxiosError, type InternalAxiosRequestConfig } from "axios";
 
 type X402RetryConfig = InternalAxiosRequestConfig & { __is402Retry?: boolean };
@@ -144,6 +148,128 @@ function createX402RetryConfig(config: InternalAxiosRequestConfig): X402RetryCon
   };
 }
 
+/** Grace after the authorization window closes before an `"unsettled"` reconcile result is trusted. */
+const RECONCILE_GRACE_MS = 15_000;
+/**
+ * Bound on held payments for one wrapped instance.
+ * A full table refuses a new purchase. It does not drop a possible spend.
+ */
+const MAX_HELD_PAYMENTS = 1_000;
+
+interface HeldPayment {
+  paymentPayload: PaymentPayload;
+  /** `null` when `accepted.maxTimeoutSeconds` is not a number. Those holds do not expire here. */
+  expiresAt: number | null;
+}
+
+interface PaymentResponseView {
+  status?: number;
+  data?: unknown;
+  headers?: unknown;
+}
+
+/**
+ * Thrown when a payment for this purchase was created, the resource did not deliver,
+ * and a later attempt still cannot show that the payment never settled.
+ * Signing a new payment here could pay twice.
+ */
+export class PaymentOutcomeUnknownError extends Error {
+  /**
+   * @param paymentPayload - The payment that was created and may have settled
+   * @param response - The last paid response, when one was received
+   */
+  constructor(
+    readonly paymentPayload: PaymentPayload,
+    readonly response: PaymentResponseView | undefined,
+  ) {
+    super(
+      `Payment outcome unknown: HTTP ${response?.status ?? "no response"} after a payment was sent; not signing again`,
+    );
+    this.name = "PaymentOutcomeUnknownError";
+  }
+}
+
+/**
+ * Thrown when a new purchase cannot be remembered without dropping one that may have settled.
+ * No payload is created for the refused purchase.
+ */
+export class PaymentHoldCapacityError extends Error {
+  constructor() {
+    super(
+      `Payment hold table is full (${MAX_HELD_PAYMENTS}); refusing to sign a new payment or drop a possible spend`,
+    );
+    this.name = "PaymentHoldCapacityError";
+  }
+}
+
+/**
+ * Stable purchase-body key, or `null` when the body cannot be re-presented safely.
+ * `null` is not an empty body. Supported values carry explicit encoding tags.
+ *
+ * @param data - Axios `config.data`
+ * @returns A stable body string, or `null` for streams, FormData, and unstringifiable values
+ */
+function stableRequestBody(data: unknown): string | null {
+  // Encoding tags distinguish binary bytes from text with the same encoding.
+  // Hex needs neither a Node Buffer global nor a browser-specific base64 API.
+  const binary = (bytes: Uint8Array): string => {
+    let hex = "";
+    for (const byte of bytes) {
+      hex += byte.toString(16).padStart(2, "0");
+    }
+    return `bytes:${hex}`;
+  };
+  if (data == null) {
+    return "empty:";
+  }
+  if (typeof data === "string" || typeof data === "number" || typeof data === "boolean") {
+    return `text:${String(data)}`;
+  }
+  if (data instanceof ArrayBuffer) {
+    return binary(new Uint8Array(data));
+  }
+  if (ArrayBuffer.isView(data)) {
+    return binary(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  }
+  if (typeof URLSearchParams !== "undefined" && data instanceof URLSearchParams) {
+    return `urlencoded:${data.toString()}`;
+  }
+  if (typeof FormData !== "undefined" && data instanceof FormData) {
+    return null;
+  }
+  if (typeof data === "object") {
+    const record = data as { pipe?: unknown };
+    if (
+      typeof record.pipe === "function" ||
+      (typeof ReadableStream !== "undefined" && data instanceof ReadableStream)
+    ) {
+      return null;
+    }
+    try {
+      const serialized = JSON.stringify(data);
+      return typeof serialized === "string" ? `json:${serialized}` : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function responseView(value: unknown): PaymentResponseView | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const candidate =
+    "response" in value && (value as { response?: unknown }).response
+      ? (value as { response?: unknown }).response
+      : value;
+  if (!candidate || typeof candidate !== "object" || !("status" in candidate)) {
+    return undefined;
+  }
+  const response = candidate as { status?: number; data?: unknown; headers?: unknown };
+  return { status: response.status, data: response.data, headers: response.headers };
+}
+
 /**
  * Wraps an Axios instance with x402 payment handling.
  *
@@ -153,6 +279,18 @@ function createX402RetryConfig(config: InternalAxiosRequestConfig): X402RetryCon
  * 2. Parse the payment requirements
  * 3. Create a payment header using the configured x402HTTPClient
  * 4. Retry the request with the payment header
+ *
+ * One purchase (caller method, caller URL, and stable body) owns one in-flight payload.
+ * The payload is held until the resource returns a status below 400, or until
+ * `accepted.maxTimeoutSeconds` plus {@link RECONCILE_GRACE_MS} have passed and
+ * `reconcilePaymentPayload` returns `"unsettled"`. A settle `errorReason`, including a
+ * snake_case token with an empty `transaction`, is not proof that nothing was broadcast:
+ * resource servers copy thrown error messages into that field.
+ *
+ * Payloads with no numeric timeout, including v1, stay held for the life of this process.
+ * The map is not kept across process restart. Streams and FormData are not keyed; those
+ * requests keep one-shot payment behavior because the body cannot be re-presented safely.
+ * At {@link MAX_HELD_PAYMENTS} a new purchase is refused rather than evicting a possible spend.
  *
  * @param axiosInstance - The Axios instance to wrap
  * @param client - Configured x402Client instance for handling payments
@@ -179,12 +317,176 @@ function createX402RetryConfig(config: InternalAxiosRequestConfig): X402RetryCon
  * @throws {Error} If the request configuration is missing
  * @throws {Error} If a payment has already been attempted for this request
  * @throws {Error} If there's an error creating the payment header
+ * @throws {PaymentOutcomeUnknownError} If a re-presented payment still is not delivered and settlement is not ruled out
+ * @throws {PaymentHoldCapacityError} If a new payment cannot be held without dropping a possible spend
  */
 export function wrapAxiosWithPayment(
   axiosInstance: AxiosInstance,
   client: x402Client | x402HTTPClient,
 ): AxiosInstance {
   const httpClient = client instanceof x402HTTPClient ? client : new x402HTTPClient(client);
+  const held = new Map<string, HeldPayment>();
+  const inflight = new Map<string, Promise<HeldPayment>>();
+
+  const headerValue = (headers: Record<string, unknown>, name: string): string | undefined => {
+    const value = headers[name] ?? headers[name.toLowerCase()];
+    return typeof value === "string" ? value : undefined;
+  };
+
+  const occupied = (): number => {
+    const keys = new Set<string>(held.keys());
+    for (const key of inflight.keys()) {
+      keys.add(key);
+    }
+    return keys.size;
+  };
+
+  const remember = (key: string, paymentPayload: PaymentPayload): HeldPayment => {
+    const maxTimeoutSeconds = paymentPayload.accepted?.maxTimeoutSeconds;
+    const expiresAt =
+      typeof maxTimeoutSeconds === "number" ? Date.now() + maxTimeoutSeconds * 1000 : null;
+    const hold = { paymentPayload, expiresAt };
+    held.set(key, hold);
+    return hold;
+  };
+
+  const reconcile = async (
+    paymentPayload: PaymentPayload,
+  ): Promise<PaymentReconcileResult> => {
+    if (typeof client.reconcilePaymentPayload !== "function") {
+      return "unknown";
+    }
+    try {
+      const outcome = await client.reconcilePaymentPayload(paymentPayload);
+      if (outcome === "settled" || outcome === "unsettled" || outcome === "unknown") {
+        return outcome;
+      }
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
+  };
+
+  const releaseIfProvenUnsettled = async (key: string, prior: HeldPayment): Promise<boolean> => {
+    if (prior.expiresAt == null) {
+      return false;
+    }
+    const now = Date.now();
+    if (now < prior.expiresAt) {
+      return false;
+    }
+    const outcome = await reconcile(prior.paymentPayload);
+    // A concurrent caller may already have replaced this hold. Only that same
+    // record may be dropped, and only on this one clock snapshot.
+    if (
+      outcome === "unsettled" &&
+      now >= prior.expiresAt + RECONCILE_GRACE_MS &&
+      held.get(key) === prior
+    ) {
+      held.delete(key);
+      return true;
+    }
+    return false;
+  };
+
+  const startPayload = (key: string, paymentRequired: PaymentRequired): Promise<HeldPayment> => {
+    const existing = inflight.get(key);
+    if (existing) {
+      return existing;
+    }
+    if (occupied() >= MAX_HELD_PAYMENTS) {
+      throw new PaymentHoldCapacityError();
+    }
+
+    const deferred: {
+      resolve: (hold: HeldPayment) => void;
+      reject: (error: unknown) => void;
+    } = {
+      resolve: () => undefined,
+      reject: () => undefined,
+    };
+    const created = new Promise<HeldPayment>((resolve, reject) => {
+      deferred.resolve = resolve;
+      deferred.reject = reject;
+    });
+    inflight.set(key, created);
+
+    // A synchronous throw from createPaymentPayload must reject `created` and
+    // leave the in-flight slot. Otherwise the next caller waits forever.
+    Promise.resolve()
+      .then(() => client.createPaymentPayload(paymentRequired))
+      .then(paymentPayload => {
+        deferred.resolve(remember(key, paymentPayload));
+      })
+      .catch(error => {
+        deferred.reject(error);
+      })
+      .finally(() => {
+        if (inflight.get(key) === created) {
+          inflight.delete(key);
+        }
+      });
+
+    return created;
+  };
+
+  const trackedPayload = async (
+    key: string,
+    paymentRequired: PaymentRequired,
+  ): Promise<{ paymentPayload: PaymentPayload; represented: boolean; hold: HeldPayment }> => {
+    const prior = held.get(key);
+    if (prior) {
+      const released = await releaseIfProvenUnsettled(key, prior);
+      if (!released) {
+        const current = held.get(key);
+        if (current) {
+          return { paymentPayload: current.paymentPayload, represented: true, hold: current };
+        }
+      }
+    }
+    const joined = inflight.get(key);
+    const hold = await (joined ?? startPayload(key, paymentRequired));
+    return { paymentPayload: hold.paymentPayload, represented: false, hold };
+  };
+
+  const purchaseKey = (config: InternalAxiosRequestConfig): string | null => {
+    const body = stableRequestBody(config.data);
+    if (body == null) {
+      return null;
+    }
+    const method = (config.method ?? "GET").toUpperCase();
+    let url = config.url ?? "";
+    try {
+      url = axiosInstance.getUri(config);
+    } catch {
+      // Keep the raw URL when Axios cannot serialize this config.
+    }
+    return JSON.stringify([method, url, body]);
+  };
+
+  const applyPayment = (
+    config: InternalAxiosRequestConfig,
+    paymentPayload: PaymentPayload,
+  ): X402RetryConfig => {
+    const paidConfig = createX402RetryConfig(config);
+    paidConfig.__is402Retry = true;
+    for (const [name, value] of Object.entries(
+      httpClient.encodePaymentSignatureHeader(paymentPayload),
+    )) {
+      setAxiosHeader(paidConfig.headers, name, value);
+    }
+    setAxiosHeader(
+      paidConfig.headers,
+      "Access-Control-Expose-Headers",
+      "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE",
+    );
+    return paidConfig;
+  };
+
+  const failedCreate = (paymentError: unknown): Error =>
+    new Error(
+      `Failed to create payment payload: ${paymentError instanceof Error ? paymentError.message : "Unknown error"}`,
+    );
 
   axiosInstance.interceptors.response.use(
     response => {
@@ -216,15 +518,8 @@ export function wrapAxiosWithPayment(
         // Parse payment requirements from response
         let paymentRequired: PaymentRequired;
         try {
-          // Create getHeader function for case-insensitive header lookup
-          const getHeader = (name: string) => {
-            const value = response.headers[name] ?? response.headers[name.toLowerCase()];
-            return typeof value === "string" ? value : undefined;
-          };
-
-          // Try to get from headers first (v2), then from body (v1)
+          const getHeader = (name: string) => headerValue(response.headers, name);
           const body = response.data as PaymentRequired | undefined;
-
           paymentRequired = httpClient.getPaymentRequiredResponse(getHeader, body);
         } catch (parseError) {
           return Promise.reject(
@@ -239,8 +534,8 @@ export function wrapAxiosWithPayment(
         const hookHeaders = await httpClient.handlePaymentRequired(paymentRequired, requestUrl);
         if (hookHeaders) {
           const hookConfig = createX402RetryConfig(originalConfig);
-          Object.entries(hookHeaders).forEach(([key, value]) => {
-            setAxiosHeader(hookConfig.headers, key, value);
+          Object.entries(hookHeaders).forEach(([name, value]) => {
+            setAxiosHeader(hookConfig.headers, name, value);
           });
           const hookResponse = await axiosInstance.request(hookConfig);
           if (hookResponse.status !== 402) {
@@ -250,77 +545,103 @@ export function wrapAxiosWithPayment(
           // Hook's retry got 402, fall through to payment
         }
 
-        // Create payment payload
-        let paymentPayload;
-        try {
-          paymentPayload = await client.createPaymentPayload(paymentRequired);
-        } catch (paymentError) {
-          return Promise.reject(
-            new Error(
-              `Failed to create payment payload: ${paymentError instanceof Error ? paymentError.message : "Unknown error"}`,
-            ),
-          );
+        const key = purchaseKey(originalConfig);
+        let paymentPayload: PaymentPayload;
+        let represented = false;
+        let trackedHold: HeldPayment | undefined;
+        if (key == null) {
+          try {
+            paymentPayload = await client.createPaymentPayload(paymentRequired);
+          } catch (paymentError) {
+            throw failedCreate(paymentError);
+          }
+        } else {
+          try {
+            const tracked = await trackedPayload(key, paymentRequired);
+            paymentPayload = tracked.paymentPayload;
+            represented = tracked.represented;
+            trackedHold = tracked.hold;
+          } catch (paymentError) {
+            if (
+              paymentError instanceof PaymentHoldCapacityError ||
+              paymentError instanceof PaymentOutcomeUnknownError
+            ) {
+              throw paymentError;
+            }
+            throw failedCreate(paymentError);
+          }
         }
 
-        // Encode payment header
-        const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
-
-        const paidConfig = createX402RetryConfig(originalConfig);
-        paidConfig.__is402Retry = true;
-
-        // Add payment headers to the request
-        Object.entries(paymentHeaders).forEach(([key, value]) => {
-          setAxiosHeader(paidConfig.headers, key, value);
-        });
-
-        // Add CORS header to expose payment response
-        setAxiosHeader(
-          paidConfig.headers,
-          "Access-Control-Expose-Headers",
-          "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE",
-        );
-
-        // Retry the request with payment
-        const secondResponse = await axiosInstance.request(paidConfig);
+        const paidConfig = applyPayment(originalConfig, paymentPayload);
+        let secondResponse;
+        try {
+          secondResponse = await axiosInstance.request(paidConfig);
+        } catch (sendError) {
+          if (represented && key != null && held.get(key) === trackedHold) {
+            throw new PaymentOutcomeUnknownError(paymentPayload, responseView(sendError));
+          }
+          throw sendError;
+        }
         if (secondResponse.status === 402) {
           assertAxiosResponseBodyWithinLimit(secondResponse.data);
         }
 
-        // Fire payment response hooks and handle recovery
-        const getResponseHeader = (name: string) => {
-          const value = secondResponse.headers[name] ?? secondResponse.headers[name.toLowerCase()];
-          return typeof value === "string" ? value : undefined;
-        };
         const result = await httpClient.processPaymentResult(
           paymentPayload,
-          getResponseHeader,
+          name => headerValue(secondResponse.headers, name),
           secondResponse.status,
         );
 
         if (result.recovered) {
-          // Retry once with a fresh payload after recovery.
-          const freshPayload = await client.createPaymentPayload(paymentRequired);
-          const retryHeaders = httpClient.encodePaymentSignatureHeader(freshPayload);
-          const retryConfig = createX402RetryConfig(originalConfig);
-          Object.entries(retryHeaders).forEach(([key, value]) => {
-            setAxiosHeader(retryConfig.headers, key, value);
-          });
-          setAxiosHeader(
-            retryConfig.headers,
-            "Access-Control-Expose-Headers",
-            "PAYMENT-RESPONSE,X-PAYMENT-RESPONSE",
-          );
-          const retryResponse = await axiosInstance.request(retryConfig);
+          // The hook may retry the request. It does not prove the sent payment
+          // never settled, so a tracked purchase re-presents that same payload.
+          // An unkeyed body has no hold, so that recovery still signs once more.
+          const retryPayload =
+            key == null
+              ? await client.createPaymentPayload(paymentRequired).catch(paymentError => {
+                  throw failedCreate(paymentError);
+                })
+              : paymentPayload;
+          const retryConfig = applyPayment(originalConfig, retryPayload);
+          let retryResponse;
+          try {
+            retryResponse = await axiosInstance.request(retryConfig);
+          } catch (sendError) {
+            if (represented && key != null && held.get(key) === trackedHold) {
+              throw new PaymentOutcomeUnknownError(paymentPayload, responseView(sendError));
+            }
+            throw sendError;
+          }
           if (retryResponse.status === 402) {
             assertAxiosResponseBodyWithinLimit(retryResponse.data);
           }
-          // Process the final retry result without another recovery attempt.
-          const getRetryHeader = (name: string) => {
-            const value = retryResponse.headers[name] ?? retryResponse.headers[name.toLowerCase()];
-            return typeof value === "string" ? value : undefined;
-          };
-          await httpClient.processPaymentResult(freshPayload, getRetryHeader, retryResponse.status);
+          await httpClient.processPaymentResult(
+            retryPayload,
+            name => headerValue(retryResponse.headers, name),
+            retryResponse.status,
+          );
+          if (retryResponse.status < 400 && key != null) {
+            // An older response must never release a newer purchase generation.
+            if (held.get(key) === trackedHold) {
+              held.delete(key);
+            }
+            return retryResponse;
+          }
+          if (represented && key != null && held.get(key) === trackedHold) {
+            throw new PaymentOutcomeUnknownError(paymentPayload, responseView(retryResponse));
+          }
           return retryResponse;
+        }
+
+        if (secondResponse.status < 400) {
+          if (key != null && held.get(key) === trackedHold) {
+            held.delete(key);
+          }
+          return secondResponse;
+        }
+
+        if (represented && key != null && held.get(key) === trackedHold) {
+          throw new PaymentOutcomeUnknownError(paymentPayload, responseView(secondResponse));
         }
 
         return secondResponse;
